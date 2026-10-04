@@ -510,14 +510,16 @@ reopen_recomp_launcher:
     }
 #endif
 
+    char *selected_rom = rom_path;
     if (!gui_resolved)
     if (argc >= 2 && argv[1][0] != '-') {
-        /* Backwards-compatible: ROM path given on command line */
-        strncpy(rom_path, argv[1], sizeof(rom_path) - 1);
+        /* Keep the complete positional path. The picker buffer is not a
+         * limit on file paths supplied by Korri or the command line. */
+        selected_rom = argv[1];
         /* Still verify CRC, but don't re-prompt on mismatch — just warn */
-        if (expected_crc != 0 && !verify_rom(rom_path, expected_crc)) {
+        if (expected_crc != 0 && !verify_rom(selected_rom, expected_crc)) {
             fprintf(stderr, "[Launcher] Warning: CRC mismatch for '%s' — continuing anyway\n",
-                    rom_path);
+                    selected_rom);
         }
     } else {
         /* Try rom.cfg first */
@@ -553,7 +555,7 @@ reopen_recomp_launcher:
     int new_argc = 0;
     int extra_start = (argc >= 2 && argv[1][0] != '-') ? 2 : 1;
     new_argv[new_argc++] = argv[0];
-    new_argv[new_argc++] = rom_path;
+    new_argv[new_argc++] = selected_rom;
     for (int i = extra_start; i < argc && new_argc < 63; i++)
         new_argv[new_argc++] = argv[i];
     new_argv[new_argc] = NULL;

@@ -30,6 +30,7 @@
 #include "savestate.h"
 #include "logger.h"
 #include "apu.h"
+#include "pal_timing.h"
 #include "mapper.h"
 #include "game_extras.h"
 #include "debug_server.h"
@@ -407,8 +408,8 @@ static void watch_render_frame(void) {
 
 /* ---- Audio state ---- */
 static SDL_AudioDeviceID  s_audio_dev = 0;
-#define AUDIO_SAMPLES_PER_FRAME 735
-static int16_t            s_audio_frame[AUDIO_SAMPLES_PER_FRAME];
+/* PAL averages 881.877 samples/frame at 44100 Hz. The largest block is 882. */
+static int16_t            s_audio_frame[882];
 
 /* SDL audio callback (round-2): runs on the audio thread at the device's steady
  * cadence and pulls mono samples from the bridge. This is the consumer that the
@@ -890,20 +891,24 @@ smoke_skip_input:
     /* Generate one frame of audio after NMI (APU registers now up-to-date).
      * Skip in turbo mode — queued audio would pile up faster than it drains. */
     if (s_audio_dev && !g_turbo && !s_smoke_frames) {
+        static double sample_remainder = 0.0;
+        sample_remainder += 44100.0 * PAL_FRAME_SECONDS;
+        int audio_samples = (int)sample_remainder;
+        sample_remainder -= audio_samples;
         static int s_synth_mode = -2;            /* -2 = not yet queried */
         static uint64_t s_synth_pos = 0;
         if (s_synth_mode == -2) s_synth_mode = recomp_audio_synth_mode();
         if (s_synth_mode != RAD_SYNTH_OFF)
             recomp_audio_synth_fill(s_synth_mode, s_audio_frame,
-                                    AUDIO_SAMPLES_PER_FRAME, 1, 44100.0, &s_synth_pos);
+                                    audio_samples, 1, 44100.0, &s_synth_pos);
         else
-            apu_generate(s_audio_frame, AUDIO_SAMPLES_PER_FRAME);
+            apu_generate(s_audio_frame, audio_samples);
 
         /* T1: raw emulator-rate PCM, before volume. */
         recomp_audio_debug_push_i16("t1_apu", s_audio_frame,
-                                    AUDIO_SAMPLES_PER_FRAME, 44100.0, 1);
+                                    audio_samples, 44100.0, 1);
 
-        /* T0: per-channel raw DAC levels for the same 735-sample window
+        /* T0: per-channel raw DAC levels for the same PAL sample window
          * (pulse1/pulse2/triangle/noise/dmc), staged by apu_generate. NULL
          * when capture is off; skipped when a synth source replaced the APU. */
         if (s_synth_mode == RAD_SYNTH_OFF) {
@@ -912,7 +917,7 @@ smoke_skip_input:
             for (int t0c = 0; t0c < 5; t0c++) {
                 const int16_t *t0buf = apu_debug_t0(t0c);
                 if (t0buf) recomp_audio_debug_push_i16(t0_names[t0c], t0buf,
-                                                       AUDIO_SAMPLES_PER_FRAME, 44100.0, 1);
+                                                       audio_samples, 44100.0, 1);
             }
         }
 
@@ -920,16 +925,16 @@ smoke_skip_input:
         int vol = g_nes_config.volume;
         if (vol < 100) {
             if (vol < 0) vol = 0;
-            for (int i = 0; i < AUDIO_SAMPLES_PER_FRAME; i++)
+            for (int i = 0; i < audio_samples; i++)
                 s_audio_frame[i] = (int16_t)((int)s_audio_frame[i] * vol / 100);
         }
         /* T2: what the bridge receives. */
         recomp_audio_debug_push_i16("t2_bridge_in", s_audio_frame,
-                                    AUDIO_SAMPLES_PER_FRAME, 44100.0, 1);
+                                    audio_samples, 44100.0, 1);
 
         if (s_bridge_ready) {
             SDL_LockMutex(s_audio_mtx);
-            rab_push(&s_bridge, s_audio_frame, AUDIO_SAMPLES_PER_FRAME);
+            rab_push(&s_bridge, s_audio_frame, audio_samples);
             double fill = rab_fill_ms(&s_bridge);
             rab_stats st; rab_get_stats(&s_bridge, &st);
             SDL_UnlockMutex(s_audio_mtx);
@@ -942,7 +947,7 @@ smoke_skip_input:
         } else {
             /* legacy fallback (bridge failed to init): old push path */
             SDL_QueueAudio(s_audio_dev, s_audio_frame,
-                           AUDIO_SAMPLES_PER_FRAME * sizeof(int16_t));
+                           audio_samples * sizeof(int16_t));
         }
     }
 
@@ -953,7 +958,7 @@ smoke_skip_input:
         static uint64_t s_audio_frames_seen = 0;
         if (s_dump_frames == -2) {
             const char *e = getenv("RECOMP_AUDIO_DEBUG_DUMP_SECS");
-            s_dump_frames = (e && *e) ? (int)(atof(e) * 60.0) : -1;
+            s_dump_frames = (e && *e) ? (int)(atof(e) / PAL_FRAME_SECONDS) : -1;
         }
         if (s_dump_frames > 0) {
             s_audio_frames_seen++;
@@ -1200,14 +1205,25 @@ smoke_skip_input:
         SDL_RenderPresent(s_renderer);
     }
 
-    /* 60Hz pacing — skipped in turbo mode */
+    /* PAL game time owns the cadence. Keep the fractional deadline across
+     * frames, including vsync waits and SDL_Delay rounding. Do not add a full
+     * sleep after each present, which would tie game speed to monitor refresh. */
+    static double next_tick = 0.0;
     if (!g_turbo) {
-        static uint32_t s_last_tick = 0;
-        uint32_t now = SDL_GetTicks();
-        if (s_last_tick == 0) s_last_tick = now;
-        uint32_t elapsed = now - s_last_tick;
-        if (elapsed < 16) SDL_Delay(16 - elapsed);
-        s_last_tick = SDL_GetTicks();
+        double frequency = (double)SDL_GetPerformanceFrequency();
+        double period = frequency * PAL_FRAME_SECONDS;
+        double now = (double)SDL_GetPerformanceCounter();
+        if (next_tick == 0.0) next_tick = now;
+        next_tick += period;
+        /* A long pause must not cause a burst of fast-forward catch-up frames. */
+        if (now > next_tick + period) next_tick = now;
+        while (now < next_tick) {
+            Uint32 delay = (Uint32)((next_tick - now) * 1000.0 / frequency);
+            SDL_Delay(delay > 0 ? delay : 1);
+            now = (double)SDL_GetPerformanceCounter();
+        }
+    } else {
+        next_tick = 0.0;
     }
 }
 
@@ -1337,7 +1353,8 @@ int nesrecomp_runner_run(int argc, char *argv[]) {
 
     runtime_session_reset();
     runtime_init();
-    keybinds_init(argv[0]);
+    /* NULL selects the native cwd-relative keybinds.ini path. */
+    keybinds_init(NULL);
     savestate_slots_init();
     game_on_init();
 

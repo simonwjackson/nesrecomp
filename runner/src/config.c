@@ -19,32 +19,9 @@
 #endif
 
 void nesrecomp_exe_dir(char *out, size_t max_len) {
-    char exe[1024];
-    int got = 0;
-#if defined(_WIN32)
-    DWORD n = GetModuleFileNameA(NULL, exe, (DWORD)sizeof(exe));
-    got = (n > 0 && n < sizeof(exe));
-#elif defined(__APPLE__)
-    uint32_t size = (uint32_t)sizeof(exe);
-    got = (_NSGetExecutablePath(exe, &size) == 0);
-#else /* Linux and other Unix */
-    /* Inside an AppImage /proc/self/exe is the read-only mount, not where
-     * the user's .AppImage + config.ini live; $APPIMAGE is the .AppImage. */
-    const char *appimg = getenv("APPIMAGE");
-    if (appimg && appimg[0] && strlen(appimg) < sizeof(exe)) {
-        strcpy(exe, appimg);
-        got = 1;
-    } else {
-        ssize_t r = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-        if (r > 0) { exe[r] = '\0'; got = 1; }
-    }
-#endif
-    if (got) {
-        char *sep = strrchr(exe, '/');
-        char *bsep = strrchr(exe, '\\');
-        if (bsep && (!sep || bsep > sep)) sep = bsep;
-        if (sep) { sep[1] = '\0'; snprintf(out, max_len, "%s", exe); return; }
-    }
+    /* Korri supplies an account-owned working directory. All callers here
+     * resolve writable state, not the packaged launcher artwork. Preserve
+     * native filenames without writes beside the immutable Nix executable. */
     snprintf(out, max_len, "./");
 }
 

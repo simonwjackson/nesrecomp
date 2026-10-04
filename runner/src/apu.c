@@ -1,20 +1,21 @@
 /*
- * apu.c — NES APU emulation (NTSC)
+ * apu.c — NES APU emulation (PAL RP2A07)
  *
  * Channels: pulse1, pulse2, triangle, noise, DMC (output-level only).
  * Frame counter: 4-step mode, ticking quarter/half-frame clocks at
- * approximately 240 Hz by distributing 4 ticks across each audio frame.
+ * approximately 200 Hz on the CPU-cycle stream.
  *
  * Audio synthesis uses a fractional timer accumulator: each sample
- * advances the timer by (CPU_FREQ / SAMPLE_RATE) ~= 40.58 CPU cycles.
+ * advances the timer by (CPU_FREQ / SAMPLE_RATE) ~= 37.70 CPU cycles.
  * Pulse timers clock every 2 CPU cycles; triangle every 1 CPU cycle.
  */
 #include "apu.h"
 #include "apu_shadow.h"
+#include "pal_timing.h"
 #include <string.h>
 #include <stdbool.h>
 
-#define CPU_FREQ        1789773.0f
+#define CPU_FREQ        PAL_CPU_HZ
 #define SAMPLE_RATE     44100
 
 /* ---- Look-up tables ---- */
@@ -36,15 +37,14 @@ static const uint8_t TRI_TABLE[32] = {
      0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15
 };
 
-/* NTSC noise timer periods in CPU cycles */
+/* PAL timer periods in CPU cycles, from NESdev APU_Noise and APU_DMC. */
 static const uint16_t NOISE_PERIOD[16] = {
-    4, 8, 16, 32, 64, 96, 128, 160, 202, 254, 380, 508, 762, 1016, 2034, 4068
+    4, 8, 14, 30, 60, 88, 118, 148, 188, 236, 354, 472, 708, 944, 1890, 3778
 };
 
-/* NTSC DMC period table — CPU cycles per output-bit clock */
 static const uint16_t DMC_RATE[16] = {
-    428, 380, 340, 320, 286, 254, 226, 214,
-    190, 160, 142, 128, 106,  84,  72,  54
+    398, 354, 316, 298, 276, 236, 210, 198,
+    176, 148, 132, 118,  98,  78,  66,  50
 };
 
 /* ---- Channel state ---- */
@@ -569,29 +569,28 @@ static void apu_step_channels(float dc) {
       while (s_dmc.timer_acc >= period) { s_dmc.timer_acc -= period; dmc_clock(); } }
 }
 
-/* Cycle-accurate frame sequencer: fire quarter/half-frame clocks + the frame IRQ
- * at their exact NTSC CPU-cycle offsets. 4-step: 7457/14913/22371/29829
- * (qf; qf+hf; qf; qf+hf+IRQ), wrap 29830. 5-step: +37281 (qf+hf), wrap 37282, no
- * IRQ. Phase anchored to the last $4017 write (which zeroes s_fc_cycle_acc). */
+/* PAL frame sequencer CPU-cycle offsets, from NESdev APU_Frame_Counter.
+ * 4-step IRQ asserts on cycles 33252..33254, wrapping after the last edge.
+ * The upstream $4017 reset behavior is retained. */
 static void advance_frame_seq(void) {
     s_fc_cycle_acc++;
     if (!s_fc_mode) {
         switch (s_fc_cycle_acc) {
-            case 7457:  quarter_frame(); break;
-            case 14913: quarter_frame(); half_frame(); break;
-            case 22371: quarter_frame(); break;
-            case 29829: quarter_frame(); half_frame();
-                        if (!s_fc_irq_inh) s_fc_irq_flag = true; break;
+            case 8313:  quarter_frame(); break;
+            case 16627: quarter_frame(); half_frame(); break;
+            case 24939: quarter_frame(); break;
+            case 33253: quarter_frame(); half_frame(); break;
         }
-        if (s_fc_cycle_acc >= 29830) s_fc_cycle_acc = 0;
+        if (s_fc_cycle_acc >= 33252 && !s_fc_irq_inh) s_fc_irq_flag = true;
+        if (s_fc_cycle_acc >= 33254) s_fc_cycle_acc = 0;
     } else {
         switch (s_fc_cycle_acc) {
-            case 7457:  quarter_frame(); break;
-            case 14913: quarter_frame(); half_frame(); break;
-            case 22371: quarter_frame(); break;
-            case 37281: quarter_frame(); half_frame(); break;
+            case 8313:  quarter_frame(); break;
+            case 16627: quarter_frame(); half_frame(); break;
+            case 24939: quarter_frame(); break;
+            case 41565: quarter_frame(); half_frame(); break;
         }
-        if (s_fc_cycle_acc >= 37282) s_fc_cycle_acc = 0;
+        if (s_fc_cycle_acc >= 41566) s_fc_cycle_acc = 0;
     }
 }
 

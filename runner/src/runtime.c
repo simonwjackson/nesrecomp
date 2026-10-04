@@ -10,6 +10,7 @@
 #include "override_chr.h"
 #include "ppu_dot.h"
 #include "crc32.h"
+#include "pal_timing.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -98,10 +99,10 @@ int     g_spr0_reads_ctr_legacy = 0;  /* used only when predict_disable=1; non-s
  * this frame. Diagnostics for the HUD-tear-during-transition bug. */
 int     g_spr0_split_write_scanline = -1;
 
-/* CPU-cycle-to-scanline conversion. PPU runs at 3x CPU; 341 dots per scanline.
- * s_ops_count is the per-frame CPU cycle accumulator from maybe_trigger_vblank. */
+/* Convert the accumulated CPU clock, not each instruction, so the PAL
+ * fractional dot remainder survives. */
 static inline int scanline_from_cycles(uint32_t cpu_cycles) {
-    return (int)((cpu_cycles * 3u) / 341u);
+    return (int)((cpu_cycles * PAL_CPU_DIVIDER) / (PAL_PPU_DIVIDER * PAL_DOTS_PER_LINE));
 }
 static int     g_ppuaddr_latch = 0;
 /* NOTE: g_scroll_latch removed — real NES shares a single write toggle
@@ -495,37 +496,18 @@ uint32_t runtime_pop_forced_caps(void) {
     return (c << 24) | (b << 16) | a;
 }
 
-/* Cycle budget per frame.  Real NES: 29780.666 CPU cycles between NMIs
- * (341*262/3 for NTSC).  Generated code passes each instruction's cycle
- * count to maybe_trigger_vblank(). */
-#define OPS_PER_FRAME 29781
+/* PAL: 33247.5 CPU cycles between video frames. Carry the half-cycle
+ * instead of rounding every frame. No NTSC odd-frame dot skip or clock mode. */
+static uint32_t s_clock_remainder = 0;
+static uint32_t s_frame_budget = PAL_FRAME_DOTS * PAL_PPU_DIVIDER / PAL_CPU_DIVIDER;
 
-/* Rung 2 — dot-accurate frame length (env NESRECOMP_DOT_CLOCK, default OFF).
- * The fixed 29781 threshold runs +0.5 cyc/frame fast vs the NTSC 29780.5 average
- * (measured by the co-sim: recomp 29780.999 vs Mesen 29780.500). The true frame
- * is 89342 PPU dots (=29780.667 cyc), or 89341 on odd frames with rendering on
- * (the skipped pre-render dot). We track the exact dot debt and hand back an
- * INTEGER per-frame CPU-cycle budget carrying the remainder thirds, so the mean
- * frame length is the oracle's 29780.5 instead of 29781 — the frame boundary
- * becomes a dot event, not a fixed cycle count. Gated + default-off until the
- * co-sim certifies no game-logic regression; then it becomes the default. */
-#define FRAME_DOTS_EVEN 89342          /* 341 * 262 */
-static int      s_dotclock     = -1;   /* -1 unqueried, 0 legacy, 1 dot-accurate */
-static int      s_odd_frame    = 0;    /* toggles each frame (odd-frame dot skip) */
-static int      s_dot_debt     = 0;    /* leftover dots (0..2) carried across frames */
-static uint32_t s_frame_budget = OPS_PER_FRAME;  /* current frame's integer cycle target */
-
-/* Compute the NEXT frame's integer CPU-cycle budget from the exact dot count,
- * carrying the sub-cycle remainder so the running mean is dot-accurate. */
 static uint32_t next_frame_budget(void) {
-    if (s_dotclock <= 0) return OPS_PER_FRAME;
-    int dots = FRAME_DOTS_EVEN - ((s_odd_frame && (g_ppumask & 0x18)) ? 1 : 0);
-    s_odd_frame ^= 1;
-    s_dot_debt += dots;
-    uint32_t cyc = (uint32_t)(s_dot_debt / 3);
-    s_dot_debt -= (int)(cyc * 3);
+    s_clock_remainder += PAL_FRAME_DOTS * PAL_PPU_DIVIDER;
+    uint32_t cyc = s_clock_remainder / PAL_CPU_DIVIDER;
+    s_clock_remainder %= PAL_CPU_DIVIDER;
     return cyc;
 }
+static int s_clock_initialized = 0;
 
 /* bus_tick: called by nes_read/nes_write to count bus operations.
  * Kept for backward compatibility but no longer critical for NMI timing
@@ -787,8 +769,9 @@ void nes_ppumem_trace_frame(void) {
  * carry their true video-frame number, so they align to the oracle across gaps.
  * Each trace function is individually env-gated → no-op in normal builds. */
 void nes_cosim_emit_boundary(void) {
-    /* round(g_frame_boundary_cyc / 29780.5) = NTSC video-frame number. */
-    g_cosim_vframe = (2ULL * g_frame_boundary_cyc + 29780ULL) / 59561ULL;
+    /* Round the PAL boundary CPU clock to its video-frame number. */
+    const uint64_t frame_clocks = PAL_FRAME_DOTS * PAL_PPU_DIVIDER;
+    g_cosim_vframe = (g_frame_boundary_cyc * PAL_CPU_DIVIDER + frame_clocks / 2) / frame_clocks;
     nes_wram_trace_frame();
     nes_ppumem_trace_frame();
     nes_cosim_hash_frame();
@@ -862,15 +845,9 @@ static void maybe_deliver_irq(void) {
 
 void maybe_trigger_vblank(int cycles) {
 
-    /* Rung 2: one-time dot-clock init. Dot-accurate frame length is the DEFAULT
-     * (SMB live-validated by the owner + co-sim-certified on SMB/MM3); set
-     * NESRECOMP_DOT_CLOCK=0 to force the legacy fixed-29781 threshold. When off,
-     * next_frame_budget() returns OPS_PER_FRAME verbatim so the legacy path is
-     * byte-unchanged. */
-    if (s_dotclock < 0) {
-        const char *e = getenv("NESRECOMP_DOT_CLOCK");
-        s_dotclock = (e && *e) ? (*e != '0') : 1;   /* default ON */
+    if (!s_clock_initialized) {
         s_frame_budget = next_frame_budget();
+        s_clock_initialized = 1;
     }
 
     /* Drive the APU frame-counter IRQ on the CPU-cycle stream (NMI-independent),
@@ -1046,7 +1023,7 @@ void maybe_fire_pending_vblank(void) {
     nes_fring_push('V', nes_fring_shadow_digest());
     g_frame_boundary_cyc = g_nes_cycles;   /* true frame-length ruler (pre-handler) */
     /* Carry the overshoot like the immediate-fire path. This deferred path can
-     * fire well past OPS_PER_FRAME (that is why the pending mechanism exists), so
+     * fire well past the frame budget (that is why the pending mechanism exists), so
      * a single subtraction leaves any residual budget for the next frame; the
      * carry is approximate here and is superseded by the Rung-2 dot-master clock,
      * which makes the frame boundary a true dot event rather than a threshold. */
@@ -2491,7 +2468,8 @@ void runtime_session_reset(void) {
     s_scroll_2005_complete=0;s_visible_frame_valid=0;s_visible_frame_frame=0;
     g_controller1_buttons=g_controller2_buttons=0;s_ctrl1_shift=s_ctrl2_shift=0;s_ctrl1_strobe=false;
     s_vblank_depth=0;s_interrupt_epoch=0;s_ops_count=0;s_oam_dma_stall=0;
-    s_odd_frame=0;s_dot_debt=0;s_frame_budget=OPS_PER_FRAME;s_vblank_pending=0;
+    s_clock_remainder=0;s_clock_initialized=0;
+    s_frame_budget=PAL_FRAME_DOTS*PAL_PPU_DIVIDER/PAL_CPU_DIVIDER;s_vblank_pending=0;
     s_in_irq=0;s_saved_vblank_depth=0;s_open_bus=0;s_ppu_io_latch=0;
     s_tail_pending=-1;s_tail_caller=-1;s_tail_active_n=0;s_tail_pending_slot=-1;
     s_last_sync_sx=s_last_sync_sy=0;s_last_sync_t=0;s_last_sync_frame=0;

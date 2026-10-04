@@ -4,6 +4,25 @@
 
 # NESRecomp
 
+## Maintained Dr. Mario Europe branch
+
+This `korri-dr-mario-eu` branch supports the
+[simonwjackson/DrMarioNesRecomp](https://github.com/simonwjackson/DrMarioNesRecomp)
+Europe-only Linux build. It retains upstream commit
+`7f6377b74f2c1e9d1171f707dc003f71c2dc236f` and adds the tested PAL clocks,
+working-directory storage, and complete positional ROM-path handling.
+
+PAL timing is fixed in this branch. Do not use it for NTSC games or other
+regions. This is not a general region-selection implementation. Native state
+filenames and the save format are unchanged. The working directory owns settings,
+key bindings and saves; the caller must provide a writable account directory.
+Normal Korri launch still suppresses diagnostics and preserves production audio
+buffering. The game fork records verification and upstream pins.
+
+GitHub Actions are disabled. Native outputs remain private. The upstream
+instructions below describe the original project, not this branch's supported
+regions, storage paths or release assets.
+
 A static 6502 recompiler framework for NES games. Translates NES ROM machine code to C, which is then compiled to native machine code for direct execution on modern PCs.
 
 **This is NOT an emulator.** Each 6502 instruction is translated to equivalent C code at build time. JSR becomes a direct C function call, branches become gotos, and the NES hardware (PPU, APU, mapper) is simulated by the runner library.

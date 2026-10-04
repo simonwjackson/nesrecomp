@@ -19,6 +19,7 @@
 #include "nes_runtime.h"
 #include "ppu_dot.h"
 #include "mapper.h"
+#include "pal_timing.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -33,12 +34,11 @@ extern const uint32_t g_nes_palette[64];
 extern int            g_disable_render_irq;
 extern uint16_t       g_ppuaddr;
 
-/* PPU geometry. 341 dots/scanline, 3 dots/CPU cycle. Cycle 0 of the frame
- * budget is VBlank start (scanline 241). The visible region begins after 20
- * VBlank lines (241..260) + the pre-render line (261) = 21 scanlines. */
-#define DOTS_PER_LINE   341
+/* PAL: 16/5 dots per CPU cycle. From VBlank start to visible rendering,
+ * 70 VBlank lines and the pre-render line elapse. */
+#define DOTS_PER_LINE   PAL_DOTS_PER_LINE
 #define VISIBLE_LINES   240
-#define VBLANK_PRE      21
+#define VBLANK_PRE      71
 #define DOT_MAXW        512          /* max framebuffer width (matches s_framebuf) */
 
 static uint32_t *s_fb        = NULL;             /* presentation framebuffer */
@@ -347,7 +347,7 @@ void ppu_dot_advance(uint32_t ops) {
 
     /* Scanline offset from VBlank start (cycle 0). Visible scanline index = the
      * offset minus the VBlank + pre-render lines. */
-    int sl  = (int)((ops * 3u) / DOTS_PER_LINE);
+    int sl  = (int)((ops * PAL_CPU_DIVIDER) / (PAL_PPU_DIVIDER * DOTS_PER_LINE));
     int vis = sl - VBLANK_PRE;
     if (vis < 0) return;                          /* still in VBlank / pre-render */
 
